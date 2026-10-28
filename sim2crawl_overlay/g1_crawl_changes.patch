@@ -1,0 +1,358 @@
+diff --git a/sim2sim_mj/crawl_sequencer.py b/sim2sim_mj/crawl_sequencer.py
+new file mode 100644
+index 0000000..ba2aca8
+--- /dev/null
++++ b/sim2sim_mj/crawl_sequencer.py
+@@ -0,0 +1,106 @@
++"""
++Crouch -> crawl -> stand-up sequencer for run_sim2sim_keyboard.py.
++
++This file is plain Python with NO MuJoCo / torch dependency, so its logic can be
++unit-tested on any laptop:   python3 -m unittest sim2sim_mj/test_crawl_sequencer.py
++
++How it is used (see run_sim2sim_keyboard.py):
++  * Press X  -> start_crawl():  load crawl_start policy, wait until the robot has
++                settled low, then load the crawl policy.
++  * Press Y  -> start_stand():  EXPERIMENTAL. Slowly ramp joints back to the stand
++                pose. No trained crawl->stand policy ships with this repo, so this
++                may fall. Use it to collect data, then train a real one (see
++                docs/FUTURE_INTEGRATIONS.md).
++  * Each loop iteration the main script calls update(...) and executes the returned
++    command string.
++
++Legend used in the comments below:
++  [TUNE]        safe and expected to change while testing in simulation
++  [CAUTION]     changes behaviour a lot; change one thing at a time and re-test
++  [DO NOT EDIT] logic that other code depends on
++"""
++
++# ---------------------------------------------------------------------------
++# SETTINGS
++# ---------------------------------------------------------------------------
++SEQ_CONFIG = {
++    # Policy files (relative to sim2sim_mj/). [CAUTION] must match CONFIG["policy_cycle"].
++    "crawl_start_policy": "policies/policy_crawl_start.pt",
++    "crawl_policy": "policies/policy_crawl.pt",
++
++    # [TUNE] Always wait at least this long (s) in the crawl_start policy before
++    # checking whether the robot has settled.
++    "min_start_s": 4.0,
++
++    # [TUNE] Give up waiting and go to the crawl policy anyway after this long (s).
++    "max_start_s": 12.0,
++
++    # [TUNE] Robot counts as "settled low" when base height (m) is below this ...
++    # (Crawl pose has the base at about 0.25 m; standing is about 0.75 m.)
++    "settle_height_m": 0.40,
++
++    # [TUNE] ... AND the average |joint velocity| (rad/s) is below this.
++    "settle_joint_vel": 0.5,
++
++    # [TUNE] Stand-up ramp speed (rad/s). Lower = gentler and slower. EXPERIMENTAL.
++    "stand_ramp_rate": 0.3,
++
++    # [TUNE] Seconds the stand-up ramp runs before the sequencer reports done.
++    "stand_duration_s": 12.0,
++}
++
++IDLE, CRAWL_START, CRAWL, STAND = "idle", "crawl_start", "crawl", "stand"  # [DO NOT EDIT]
++
++
++class CrawlSequencer:
++    """Tiny state machine. update() returns a command string or None.
++
++    Commands (strings the main loop understands):
++        "policy:<relative path>"   load that policy and stay in policy mode
++        "mode:default_pos"         ramp joints to the stand pose
++        "ramp_rate:<float>"        set the I/K ramp speed (rad/s)
++        "done"                     sequence finished
++    """
++
++    def __init__(self, config=None):
++        self.cfg = dict(SEQ_CONFIG if config is None else config)
++        self.state = IDLE
++        self._t0 = 0.0
++        self._announced = False
++
++    # -- starting a sequence -------------------------------------------------
++    def start_crawl(self, now):
++        self.state, self._t0, self._announced = CRAWL_START, now, False
++        return "policy:" + self.cfg["crawl_start_policy"]
++
++    def start_stand(self, now):
++        self.state, self._t0 = STAND, now
++        return "mode:default_pos"
++
++    def cancel(self):
++        self.state = IDLE
++
++    @property
++    def active(self):
++        return self.state in (CRAWL_START, STAND)
++
++    # -- called every loop ---------------------------------------------------
++    def update(self, now, base_height, mean_abs_joint_vel):
++        c = self.cfg
++        elapsed = now - self._t0
++        if self.state == CRAWL_START:
++            if elapsed < c["min_start_s"]:
++                return None
++            settled = (base_height < c["settle_height_m"]
++                       and mean_abs_joint_vel < c["settle_joint_vel"])
++            if settled or elapsed >= c["max_start_s"]:
++                self.state = CRAWL
++                return "policy:" + c["crawl_policy"]
++        elif self.state == STAND:
++            if not self._announced:
++                self._announced = True
++                return "ramp_rate:%.3f" % c["stand_ramp_rate"]
++            if elapsed >= c["stand_duration_s"]:
++                self.state = IDLE
++                return "done"
++        return None
+diff --git a/sim2sim_mj/run_sim2sim_keyboard.py b/sim2sim_mj/run_sim2sim_keyboard.py
+index dc85716..e39b37d 100644
+--- a/sim2sim_mj/run_sim2sim_keyboard.py
++++ b/sim2sim_mj/run_sim2sim_keyboard.py
+@@ -30,6 +30,9 @@ import mujoco.viewer as viewer
+ import numpy as np
+ import torch
+ 
++# Crouch -> crawl -> stand sequencer (pure Python, see crawl_sequencer.py)
++from crawl_sequencer import CrawlSequencer
++
+ # Try to import pynput library for cross-platform keyboard input (no root required on Linux)
+ try:
+     from pynput import keyboard as pynput_keyboard
+@@ -41,6 +44,12 @@ except ImportError:
+ 
+ # ============================================================================
+ # CONFIGURATION - Edit these variables to change behavior
++#
++# Legend (read before editing anything):
++#   [TUNE]        safe to change while testing in simulation
++#   [CAUTION]     changes behaviour a lot; change ONE thing at a time, re-test
++#   [DO NOT EDIT] must match the trained policies / robot model; changing it breaks things
++#   [REAL ROBOT]  re-check this value before ever running on the physical G1
+ # ============================================================================
+ 
+ CONFIG = {
+@@ -54,10 +63,10 @@ CONFIG = {
+     "device": "cpu",
+     
+     # Global action scale multiplier
+-    "action_scale": 0.5,
++    "action_scale": 0.5,  # [DO NOT EDIT] must match training. Scales policy output to joint targets.
+     
+     # Number of simulation substeps per policy step
+-    "n_substeps": 4,
++    "n_substeps": 4,  # [DO NOT EDIT] physics steps per policy step; must match training rate.
+     
+     # Path to JSON file with initial pose (or None to use default)
+     "init_pose_json": "poses/default-pose.json",
+@@ -72,13 +81,13 @@ CONFIG = {
+     "use_keyboard": True,
+     
+     # Max forward/backward velocity (m/s) - scaled by left stick Y
+-    "max_lin_vel": 2.0,
++    "max_lin_vel": 2.0,  # [TUNE] m/s forward cap. Start low (0.3-0.5) when testing crawl.
+     
+     # Max lateral velocity (m/s) - scaled by left stick X
+-    "max_lat_vel": 1.0,
++    "max_lat_vel": 1.0,  # [TUNE] m/s sideways cap.
+     
+     # Max angular velocity (rad/s) - scaled by right stick X  
+-    "max_ang_vel": 1.0,
++    "max_ang_vel": 1.0,  # [TUNE] rad/s turn-rate cap.
+     
+     # Gain adjustment step size for keyboard (q/a keys)
+     "gain_step": 0.1,
+@@ -131,16 +140,16 @@ CONFIG = {
+     # Group-based KP/KD multipliers applied to MuJoCo actuators
+     # Legs: hips, knees, ankles
+     # Upper: waist + shoulders, elbows, wrists
+-    "kp_multiplier_legs": 1.4,
+-    "kd_multiplier_legs": 1.4,
+-    "kp_multiplier_upper": 1.4,
+-    "kd_multiplier_upper": 1.4,
++    "kp_multiplier_legs": 1.4,  # [CAUTION] stiffness of leg PD. Too low = sags, too high = jitters. Q/A keys change live.
++    "kd_multiplier_legs": 1.4,  # [CAUTION] damping of leg PD.
++    "kp_multiplier_upper": 1.4,  # [CAUTION] stiffness of waist/arms. Arms carry weight while crawling.
++    "kd_multiplier_upper": 1.4,  # [CAUTION] damping of waist/arms. [REAL ROBOT] recheck all four multipliers.
+     
+     # Amount to change multipliers per button press
+     "gain_step": 0.05,
+     # Diagnostics logging (CSV) for parity with real robot
+     # Enable to record per-step dt, absolute joint positions, targets, and safety metrics
+-    "diag_log": True,
++    "diag_log": True,  # [TUNE] keep True: CSV logs let us diagnose falls. Files go to outputs/diagnostics.
+     # Optional explicit file path; if empty, a timestamped file will be created under diag_dir
+     "diag_file": "",
+     # Directory for diagnostics when diag_file not set
+@@ -359,6 +368,9 @@ class KeyboardController:
+             'i': False,       # I - 默认位置模式 (D-PAD UP)
+             'j': False,       # J - 阻尼模式 (D-PAD LEFT)
+             'k': False,       # K - 爬行位置模式 (D-PAD DOWN)
++            'p': False,       # P - return to policy mode (added)
++            'x': False,       # X - run crouch->crawl sequence (added)
++            'y': False,       # Y - EXPERIMENTAL stand-up ramp (added)
+             # 策略和系统控制
+             'space': False,   # SPACE - 循环切换策略
+             'esc': False,     # ESC - 退出程序
+@@ -413,6 +425,8 @@ class KeyboardController:
+         self._prev_i_state = False
+         self._prev_j_state = False
+         self._prev_k_state = False
++        self._prev_x_state = False
++        self._prev_y_state = False
+         self._prev_q_state = False
+         self._prev_a_state = False
+         self._prev_h_state = False
+@@ -431,6 +445,10 @@ class KeyboardController:
+         print("    I: Default Position mode (stand)")
+         print("    J: Damped mode (safe stop)")
+         print("    K: Crawl Position mode")
++        print("    P: Back to policy mode")
++        print("  Sequences (added):")
++        print("    X: crouch -> crawl   (crawl_start policy, wait to settle, crawl policy)")
++        print("    Y: stand up (EXPERIMENTAL ramp, may fall)")
+         print("    (Note: Robot starts in policy/standing mode)")
+         print()
+         if self.policy_cycle:
+@@ -536,9 +554,29 @@ class KeyboardController:
+             self._prev_k_state = current_k
+             return "crawl_pos"
+         self._prev_k_state = current_k
+-        
++
++        # P - hand control back to the policy (added: without this there is no
++        # way to leave I/J/K modes, so SPACE policy switching never works again)
++        current_p = self._key_states.get('p', False)
++        if current_p and not getattr(self, '_prev_p_state', False):
++            self.control_mode = "policy"
++            print("[KEYBOARD] P pressed -> Switched to POLICY mode")
++            self._prev_p_state = current_p
++            return "policy"
++        self._prev_p_state = current_p
++
+         return None
+     
++    def check_sequence_keys(self) -> str | None:
++        """X -> 'crawl', Y -> 'stand' (edge triggered). Added for the sequencer."""
++        out = None
++        for key, name in (('x', 'crawl'), ('y', 'stand')):
++            cur = self._key_states.get(key, False)
++            if cur and not getattr(self, f'_prev_{key}_state'):
++                out = name
++            setattr(self, f'_prev_{key}_state', cur)
++        return out
++
+     def check_policy_switch(self) -> str | None:
+         """Check if SPACE key was pressed to switch policy.
+         Only works in policy mode.
+@@ -1680,6 +1718,22 @@ def main():
+                         if i < controller.num_robot_joints:
+                             data.ctrl[i] = angle_dict[joint_name]
+         
++        # Rate-limited joint targets. The original code wrote the final pose into
++        # data.ctrl in one step (a step input into the PD servos), which throws the
++        # robot over when going stand <-> crawl. Move at most RAMP_RATE rad/s instead.
++        # [TUNE] Default speed for I/K pose moves in rad/s. Lower = gentler/slower.
++        #        0.5 takes ~5 s to move a joint 2.5 rad. The stand-up sequence changes it.
++        ramp = {"rate": 0.5}
++        sequencer = CrawlSequencer()
++
++        def ramp_toward(angle_dict, mj_model, data, controller):
++            dt = mj_model.opt.timestep
++            for i, joint_name in enumerate(controller.joint_names):
++                if joint_name in angle_dict and i < controller.num_robot_joints:
++                    cur = data.ctrl[i]
++                    step_max = ramp["rate"] * dt
++                    data.ctrl[i] = cur + max(-step_max, min(step_max, angle_dict[joint_name] - cur))
++
+         while v.is_running():
+             # Poll GLFW events to update gamepad state (keyboard library handles its own polling)
+             if gamepad:
+@@ -1696,6 +1750,32 @@ def main():
+                 if new_mode:
+                     control_mode = new_mode
+                     keyboard.control_mode = new_mode
++                    sequencer.cancel()  # manual mode keys override any running sequence
++                    ramp["rate"] = 0.5
++
++                # X / Y sequences (see crawl_sequencer.py)
++                seq_key = keyboard.check_sequence_keys()
++                seq_cmd = None
++                if seq_key == 'crawl':
++                    control_mode = keyboard.control_mode = "policy"
++                    seq_cmd = sequencer.start_crawl(data.time)
++                elif seq_key == 'stand':
++                    seq_cmd = sequencer.start_stand(data.time)
++                elif sequencer.active:
++                    seq_cmd = sequencer.update(
++                        data.time,
++                        float(data.qpos[2]),  # base height (m)
++                        float(np.mean(np.abs(data.qvel[6:6 + controller.num_robot_joints]))),
++                    )
++                if seq_cmd:
++                    print(f"[SEQUENCE] {seq_cmd}")
++                    kind, _, arg = seq_cmd.partition(":")
++                    if kind == "policy":
++                        controller.load_policy(script_dir / arg)
++                    elif kind == "mode":
++                        control_mode = keyboard.control_mode = arg
++                    elif kind == "ramp_rate":
++                        ramp["rate"] = float(arg)
+                 
+                 # Check gain adjustment (Q/A/H keys)
+                 gain_delta, should_print_gain = keyboard.check_gain_adjustment()
+@@ -1751,11 +1831,9 @@ def main():
+             # Handle different control modes (keyboard only)
+             if keyboard and control_mode != "policy":
+                 if control_mode == "default_pos":
+-                    # Set to default standing position
+-                    set_joint_targets_from_dict(STAND_DEFAULT_ANGLES, mj_model, data, controller)
++                    ramp_toward(STAND_DEFAULT_ANGLES, mj_model, data, controller)
+                 elif control_mode == "crawl_pos":
+-                    # Set to crawl position (use training defaults which is crawl pose)
+-                    set_joint_targets_from_dict(TRAINING_DEFAULT_ANGLES, mj_model, data, controller)
++                    ramp_toward(TRAINING_DEFAULT_ANGLES, mj_model, data, controller)
+                 elif control_mode == "damped":
+                     # Damped mode: set all controls to zero (high damping)
+                     data.ctrl[:controller.num_robot_joints] = 0.0
+diff --git a/sim2sim_mj/test_crawl_sequencer.py b/sim2sim_mj/test_crawl_sequencer.py
+new file mode 100644
+index 0000000..259bbbd
+--- /dev/null
++++ b/sim2sim_mj/test_crawl_sequencer.py
+@@ -0,0 +1,30 @@
++"""Offline tests for crawl_sequencer.py (no simulator needed)."""
++import unittest
++from crawl_sequencer import CrawlSequencer, SEQ_CONFIG, CRAWL, IDLE
++
++
++class T(unittest.TestCase):
++    def test_crawl_waits_then_switches_when_settled(self):
++        s = CrawlSequencer()
++        self.assertEqual(s.start_crawl(0.0), "policy:" + SEQ_CONFIG["crawl_start_policy"])
++        self.assertIsNone(s.update(1.0, 0.2, 0.0))          # too early even if settled
++        self.assertIsNone(s.update(5.0, 0.7, 0.0))          # still tall
++        self.assertIsNone(s.update(5.0, 0.3, 2.0))          # still moving
++        self.assertEqual(s.update(5.0, 0.3, 0.1), "policy:" + SEQ_CONFIG["crawl_policy"])
++        self.assertEqual(s.state, CRAWL)
++
++    def test_crawl_timeout(self):
++        s = CrawlSequencer(); s.start_crawl(0.0)
++        self.assertEqual(s.update(13.0, 0.9, 9.0), "policy:" + SEQ_CONFIG["crawl_policy"])
++
++    def test_stand_sequence(self):
++        s = CrawlSequencer()
++        self.assertEqual(s.start_stand(0.0), "mode:default_pos")
++        self.assertTrue(s.update(0.1, 0.3, 0.0).startswith("ramp_rate:"))
++        self.assertIsNone(s.update(5.0, 0.3, 0.0))
++        self.assertEqual(s.update(13.0, 0.3, 0.0), "done")
++        self.assertEqual(s.state, IDLE)
++
++
++if __name__ == "__main__":
++    unittest.main()
